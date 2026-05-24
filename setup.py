@@ -25,6 +25,8 @@ setup(
     entry_points={
         'console_scripts': [
             'tof_imager_publisher = tof_imager_ros.tof_imager_publisher:main',
+            'new_imager_publisher = tof_imager_ros.new_imager_publisher:main',
+            'cloud_and_scan_publisher = tof_imager_ros.cloud_and_scan_publisher:main',
             'tof_imager_node = tof_imager_ros.tof_imager_node:main',
         ],
     },
