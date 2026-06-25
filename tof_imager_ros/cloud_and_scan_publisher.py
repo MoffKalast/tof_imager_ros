@@ -1,4 +1,5 @@
 import sys
+import warnings
 import rclpy
 import numpy as np
 from collections import deque
@@ -12,86 +13,50 @@ from sensor_msgs.msg import PointCloud2, PointField, LaserScan
 from vl53l5cx.vl53l5cx import VL53L5CX as ToFImager, VL53L5CXResultsData as ToFImagerResults
 
 class ScanDensifier:
-    def __init__(self, num_beams=32, fov_deg=60, history_size=3, max_interp_gap=4, gradient_threshold=0.20):
-        self.num_beams = num_beams
-        self.fov = np.deg2rad(fov_deg)
-        self.history = deque(maxlen=history_size)
-        self.max_gap = max_interp_gap  # in "virtual beam" units
-        self.grad_thresh = gradient_threshold  # relative (10%)
-        
-        # Virtual beam angles
-        self.angles = np.linspace(-self.fov/2, self.fov/2, num_beams)
-        
-    def update(self, raw_angles, row1_ranges, row2_ranges):
-        """
-        raw_angles: beam angles (length 8)
-        row1_ranges: top row ranges (length 8)
-        row2_ranges: second row ranges (length 8)
-        """
-        # 1. Map both rows to virtual grid for this frame
-        frame = np.full((2, self.num_beams), np.nan)
-        for ang, rng1, rng2 in zip(raw_angles, row1_ranges, row2_ranges):
-            idx = np.argmin(np.abs(self.angles - ang))
-            frame[0, idx] = rng1
-            frame[1, idx] = rng2
-        
-        self.history.append(frame)
-        
-        # 2. Median across time AND both rows (2 rows x up to 3 frames = up to 6 values)
-        if len(self.history) < 2:
-            return frame[0, :]  # Not enough history yet
-        
-        stacked = np.stack(self.history, axis=0)  # (H, 2, N)
-        all_values = stacked.reshape(-1, self.num_beams)  # (H*2, N)
-        temporal = np.nanmedian(all_values, axis=0)  # (N,)
-        
-        # 3. Spatial interpolation with edge awareness
-        return self._interpolate(temporal)
+	def __init__(self, num_beams, angle_min, angle_max, max_interp_angle, history_size=3, gradient_threshold=0.20):
+		self.num_beams = num_beams
+		self.angle_min = angle_min
+		self.angle_max = angle_max
+		self.angles = np.linspace(angle_min, angle_max, num_beams)
+		self.history = deque(maxlen=history_size)
+		# Bridge gaps up to a fixed angular width, converted to beams from the actual
+		# beam pitch, so the reach is independent of num_beams.
+		self.max_gap = int(round(max_interp_angle / ((angle_max - angle_min) / (num_beams - 1))))
+		self.grad_thresh = gradient_threshold
 
-    """ def update(self, raw_angles, raw_ranges):
-        # 1. Temporal accumulation: map raw beams to virtual grid, store history
-        frame = np.full(self.num_beams, np.nan)
-        for ang, rng in zip(raw_angles, raw_ranges):
-            idx = np.argmin(np.abs(self.angles - ang))
-            frame[idx] = rng
-        
-        self.history.append(frame)
-        
-        # 2. Median filter across time (per beam)
-        if len(self.history) < 2:
-            return frame  # Not enough history yet
-        
-        temporal = np.nanmedian(np.stack(self.history), axis=0)
-        
-        # 3. Spatial interpolation with edge awareness
-        return self._interpolate(temporal) """
-    
-    def _interpolate(self, ranges):
-        valid = ~np.isnan(ranges)
-        if valid.sum() < 2:
-            return ranges
-        
-        result = ranges.copy()
-        indices = np.where(valid)[0]
-        
-        for i in range(len(indices) - 1):
-            left, right = indices[i], indices[i+1]
-            gap = right - left - 1
-            
-            if gap == 0 or gap > self.max_gap:
-                continue
-            
-            r_left, r_right = ranges[left], ranges[right]
-            # Relative gradient check
-            if abs(r_right - r_left) / max(r_left, r_right, 0.001) > self.grad_thresh:
-                continue  # Edge detected, don't interpolate
-            
-            # Linear interpolation (or cubic if gap is large enough)
-            for j in range(1, gap + 1):
-                t = j / (gap + 1)
-                result[left + j] = r_left * (1 - t) + r_right * t
-                
-        return result
+	def update(self, zone_angles, rows):
+		frame = np.full((rows.shape[0], self.num_beams), np.nan)
+		for j, ang in enumerate(zone_angles):
+			frame[:, np.argmin(np.abs(self.angles - ang))] = rows[:, j]
+		self.history.append(frame)
+
+		# Robust median over every available return (chosen rows x history). A lone
+		# sun glint or flicker in one row/frame gets outvoted instead of dropped.
+		stacked = np.concatenate(list(self.history), axis=0)
+		with warnings.catch_warnings():
+			warnings.simplefilter('ignore', category=RuntimeWarning)
+			combined = np.nanmedian(stacked, axis=0)
+		return self._interpolate(combined)
+
+	def _interpolate(self, ranges):
+		valid = ~np.isnan(ranges)
+		if valid.sum() < 2:
+			return ranges
+
+		result = ranges.copy()
+		indices = np.where(valid)[0]
+		for i in range(len(indices) - 1):
+			left, right = indices[i], indices[i+1]
+			gap = right - left - 1
+			if gap == 0 or gap > self.max_gap:
+				continue
+			r_left, r_right = ranges[left], ranges[right]
+			if abs(r_right - r_left) / max(r_left, r_right, 0.001) > self.grad_thresh:
+				continue  # edge detected, don't bridge it
+			for j in range(1, gap + 1):
+				t = j / (gap + 1)
+				result[left + j] = r_left * (1 - t) + r_right * t
+		return result
 
 class ToFImagerPublisher(Node):
 	def __init__(self):
@@ -103,14 +68,35 @@ class ToFImagerPublisher(Node):
 			('mode', 1),
 			('ranging_freq', 15),
 			('timer_period', 0.1),
+			('fov_deg', 60.0),
+			('scan_range_min', 0.02),
+			('scan_range_max', 1.0),
+			('scan_rows', [0, 1]),
+			('valid_status', [5]),
+			('max_ambient', 0.0),
+			('num_beams', 50),
+			('max_interp_zones', 1.2),
+			('color_range', 0.2),
 		])
-
-		self.densifier = ScanDensifier()
 
 		self.frame_id = self.get_parameter('frame_id').value
 		self.res = self.get_parameter('resolution').value
 		self.mode = self.get_parameter('mode').value
 		self.freq = self.get_parameter('ranging_freq').value
+		self.fov = np.deg2rad(self.get_parameter('fov_deg').value)
+		self.range_min = self.get_parameter('scan_range_min').value
+		self.range_max = self.get_parameter('scan_range_max').value
+		self.scan_rows = list(self.get_parameter('scan_rows').value)
+		self.valid_status = np.array(self.get_parameter('valid_status').value)
+		self.max_ambient = self.get_parameter('max_ambient').value
+		self.color_range = self.get_parameter('color_range').value
+
+		# Beams sit at zone-center angles, not the FoV edges: the outermost zone center
+		# is half a zone in from the edge, so the span is fov*(1 - 1/res).
+		self.zone_angles = (np.arange(self.res) - (self.res-1)/2.0) * (self.fov/self.res)
+		half_span = (self.fov/2.0) * (1.0 - 1.0/self.res)
+		max_interp_angle = self.get_parameter('max_interp_zones').value * (self.fov/self.res)
+		self.densifier = ScanDensifier(self.get_parameter('num_beams').value, -half_span, half_span, max_interp_angle)
 
 		self.pcl_pub = self.create_publisher(PointCloud2, 'pointcloud', 10)
 		self.scan_pub = self.create_publisher(LaserScan, 'scan', 10)
@@ -162,30 +148,51 @@ class ToFImagerPublisher(Node):
 		except Exception:
 			return None
 
-		distance_mm = np.array(data.distance_mm[:(self.res*self.res)]).reshape(self.res, self.res)
-
+		n = self.res * self.res
+		distance_mm = np.array(data.distance_mm[:n]).reshape(self.res, self.res)
 		depth_m = np.where(distance_mm < 0, 0, distance_mm).astype(np.float32) / 1000.0
-		depth_mm = np.where(distance_mm < 0, 0, distance_mm).astype(np.uint16)
 
-		buf = np.empty((self.res, self.res, 3), dtype=np.float32)
-		per_px = np.deg2rad(45) / self.res
-
+		# distance is radial (a flat wall reads farther at the corners), so convert to
+		# cartesian here: forward = d*cos(az)*cos(el) makes a flat wall land flat. az is
+		# taken from the row index and el from the column, matching the original axes.
+		per_px = self.fov / self.res
+		buf = np.empty((self.res, self.res, 4), dtype=np.float32)
 		for w in range(self.res):
 			for h in range(self.res):
 				d = depth_m[w, h]
-				x = d * np.cos(w*per_px - np.deg2rad(45)/2 - np.deg2rad(90))
-				y = -(d * np.sin(h*per_px - np.deg2rad(45)/2))
-				z = d
-				buf[w, h] = [x, y, z]
+				az = (w - (self.res-1)/2.0) * per_px
+				el = (h - (self.res-1)/2.0) * per_px
+				buf[w, h, :3] = [d*np.sin(az)*np.cos(el), -d*np.sin(el), d*np.cos(az)*np.cos(el)]
 
-		return buf, depth_m, depth_mm
+		# Packed rgb coloured by the z column: blue at 0, green at +range, red at -range.
+		# Note z is forward depth here (always >= 0), so red never shows; set cval = y for
+		# height colouring instead.
+		cval = buf[:, :, 0]
+		t_pos = np.clip(-cval / self.color_range, 0, 1)
+		t_neg = np.clip(cval / self.color_range, 0, 1)
+		r = (255 * t_neg).astype(np.uint32)
+		g = (255 * t_pos).astype(np.uint32)
+		b = (255 * np.clip(1 - t_pos - t_neg, 0, 1)).astype(np.uint32)
+		buf[:, :, 3] = ((r << 16) | (g << 8) | b).view(np.float32)
+
+		# Scan path: separate quality-masked depth so cloud output is unaffected.
+		scan_m = depth_m.copy()
+		scan_m[distance_mm < 0] = np.nan
+		if self.valid_status.size and hasattr(data, 'target_status'):
+			status = np.array(data.target_status[:n]).reshape(self.res, self.res)
+			scan_m[~np.isin(status, self.valid_status)] = np.nan
+		if self.max_ambient > 0 and hasattr(data, 'ambient_per_spad'):
+			ambient = np.array(data.ambient_per_spad[:n]).reshape(self.res, self.res)
+			scan_m[ambient > self.max_ambient] = np.nan
+
+		return buf, depth_m, scan_m
 
 	def publish_data(self):
 		sensor_data = self.read_sensor()
 		if sensor_data is None:
 			return
 
-		buf, depth_m, depth_mm = sensor_data
+		buf, depth_m, scan_m = sensor_data
 		now = self.get_clock().now().to_msg()
 
 		pc_msg = PointCloud2(
@@ -195,36 +202,34 @@ class ToFImagerPublisher(Node):
 			fields=[
 				PointField(name="x", offset=0, datatype=PointField.FLOAT32, count=1),
 				PointField(name="y", offset=4, datatype=PointField.FLOAT32, count=1),
-				PointField(name="z", offset=8, datatype=PointField.FLOAT32, count=1)
+				PointField(name="z", offset=8, datatype=PointField.FLOAT32, count=1),
+				PointField(name="rgb", offset=12, datatype=PointField.FLOAT32, count=1)
 			],
 			is_bigendian=False,
 			is_dense=False,
-			point_step=12,
-			row_step=12 * self.res,
+			point_step=16,
+			row_step=16 * self.res,
 			data=buf.astype(np.float32).tobytes()
 		)
 		self.pcl_pub.publish(pc_msg)
 
-		# Use raw depth_m from the top row as ranges — buf contains projected XYZ so
-		# norm() on those would give distorted distances. The 27deg pitch offset from
-		# boresight to the top row center is handled by laser_link's TF in the URDF.
-		fov = np.deg2rad(60.0)
-		raw_angles = np.linspace(-fov / 2, fov / 2, self.res)
-		raw_angles_reversed = raw_angles[::-1]
-		#dense_ranges = self.densifier.update(raw_angles_reversed, depth_m[0, :])
-		top_row = depth_m[0, :]
-		second_row = depth_m[1, :]
-		dense_ranges = self.densifier.update(raw_angles_reversed, top_row, second_row)
+		zone_angles = self.zone_angles[::-1]  # reversed to match sensor column order
+		rows = scan_m[self.scan_rows, :].copy()
+		rows[rows > self.range_max] = np.nan
+		dense_ranges = self.densifier.update(zone_angles, rows)
+
+		in_range = (dense_ranges >= self.range_min) & (dense_ranges <= self.range_max)
+		dense_ranges = np.where(in_range, dense_ranges, np.inf)
 
 		scan_msg = LaserScan(
 			header=Header(stamp=now, frame_id='laser_link'),
-			angle_min=-fov / 2,
-			angle_max=fov / 2,
-			angle_increment=fov / (self.densifier.num_beams-1),
+			angle_min=self.densifier.angle_min,
+			angle_max=self.densifier.angle_max,
+			angle_increment=(self.densifier.angle_max - self.densifier.angle_min) / (self.densifier.num_beams-1),
 			time_increment=0.0,
 			scan_time=self.get_parameter('timer_period').value,
-			range_min=0.02,
-			range_max=4.0,
+			range_min=self.range_min,
+			range_max=self.range_max,
 			ranges=dense_ranges.astype(np.float32).tolist(),
 			intensities=[]
 		)
